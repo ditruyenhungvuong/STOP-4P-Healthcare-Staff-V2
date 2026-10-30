@@ -78,22 +78,43 @@
   }
 
   /* ================= Điều hướng ================= */
+  /* Stack màn hình đồng bộ với lịch sử trình duyệt (T-20).
+   * Mỗi mục lịch sử mang { gen, depth }: depth = độ dài stack lúc đó; gen tăng mỗi lần resetTo (đăng xuất, kết thúc phiên…)
+   * để Back không quay về màn của lượt cũ. Back trình duyệt cắt stack về đúng depth và giữ phần bị cắt trong `fwd`,
+   * nhờ vậy Forward dựng lại được màn vừa rời (trước đây popstate nào cũng bị coi là Back). */
   const SCREENS = {};
+  let gen = 0, fwd = [], historyOk = true;
+  const histState = () => ({ gen, depth: state.stack.length });
+  function pushHist() { try { history.pushState(histState(), ''); } catch (e) { historyOk = false; } }
+  function replaceHist() { try { history.replaceState(histState(), ''); } catch (e) { historyOk = false; } }
   function go(name, params = {}, opts = {}) {
-    if (opts.replace && state.stack.length) state.stack[state.stack.length - 1] = { name, params };
+    const top = state.stack[state.stack.length - 1];
+    if (opts.replace && state.stack.length) { state.stack[state.stack.length - 1] = { name, params }; replaceHist(); }
     else {
+      // bấm đúp một nút điều hướng không đẩy cùng một màn hai lần vào stack
+      if (top && top.name === name && JSON.stringify(top.params || {}) === JSON.stringify(params || {})) return;
       state.stack.push({ name, params });
-      try { history.pushState({ depth: state.stack.length }, ''); } catch (e) { /* file:// */ }
+      fwd = [];
+      pushHist();
     }
     render();
   }
   function back() {
-    if (state.stack.length > 1) { state.stack.pop(); render(); }
+    if (state.stack.length > 1) { fwd = state.stack.splice(state.stack.length - 1).concat(fwd); render(); }
   }
-  window.addEventListener('popstate', () => back());
-  const resetTo = (name, params = {}) => { state.stack = []; go(name, params); };
+  window.addEventListener('popstate', e => {
+    const s = e.state;
+    if (!s || s.gen !== gen) { replaceHist(); return; } // mục lịch sử của lượt trước → đứng yên ở màn hiện tại
+    const d = Math.max(1, s.depth | 0);
+    if (d < state.stack.length) { fwd = state.stack.splice(d).concat(fwd); render(); }
+    else if (d > state.stack.length && fwd.length >= d - state.stack.length) { state.stack.push(...fwd.splice(0, d - state.stack.length)); render(); }
+    else replaceHist();
+  });
+  const resetTo = (name, params = {}) => { gen++; state.stack = []; fwd = []; go(name, params); };
 
+  let lastRenderAt = 0;
   function render() {
+    lastRenderAt = performance.now();
     runCleanups();
     const top = state.stack[state.stack.length - 1] || { name: 'welcome', params: {} };
     const scr = SCREENS[top.name] || SCREENS.welcome;
@@ -149,6 +170,29 @@
   }
 
   /* ================= Tài khoản ================= */
+  /* T-10: dữ liệu localStorage là input KHÔNG tin được (máy dùng chung, sửa tay, bản ghi của phiên bản cũ).
+   * Chuẩn hóa từng bản ghi khi nạp để màn Hành trình không vỡ (và không mất nút xóa dữ liệu), số 0–10 không thành HTML. */
+  const n10 = v => (Number.isInteger(v) && v >= 0 && v <= 10 ? v : null);
+  const strOrNull = v => (typeof v === 'string' ? v : null);
+  const strArr = v => (Array.isArray(v) ? v.filter(x => typeof x === 'string') : []);
+  function sanitizeAccount(acc) {
+    if (!acc || typeof acc !== 'object' || Array.isArray(acc)) return null;
+    acc.phone_masked = strOrNull(acc.phone_masked) || '';
+    acc.consents = Array.isArray(acc.consents) ? acc.consents.filter(c => c && typeof c === 'object' && typeof c.purpose === 'string') : [];
+    acc.profile = acc.profile && typeof acc.profile === 'object' && !Array.isArray(acc.profile) ? acc.profile : null;
+    acc.checkins = (Array.isArray(acc.checkins) ? acc.checkins : []).filter(r => r && typeof r === 'object' && !Array.isArray(r)).map(r => ({
+      ...r,
+      id: strOrNull(r.id) || uid(),
+      created_at: strOrNull(r.created_at) && !isNaN(Date.parse(r.created_at)) ? r.created_at : null,
+      emotion_codes: strArr(r.emotion_codes), context_codes: strArr(r.context_codes),
+      exercise_ids: strArr(r.exercise_ids).filter(id => EX[id]),
+      distress_before: n10(r.distress_before), distress_after: n10(r.distress_after),
+      helpfulness: strOrNull(r.helpfulness), narrative: strOrNull(r.narrative),
+      journal: r.journal && typeof r.journal === 'object' && !Array.isArray(r.journal) ? r.journal : null
+    }));
+    return acc;
+  }
+  const loadAccount = key => sanitizeAccount(S.load(key));
   const hasConsent = p => !!state.account?.consents?.some(c => c.purpose === p && !c.revoked_at);
   function persist() { if (state.mode === 'member' && state.memberKey && state.account) S.save(state.memberKey, state.account); }
   const currentProfile = () => (state.mode === 'member' ? state.account?.profile : state.profile);
@@ -184,24 +228,58 @@
     persist();
     return true;
   }
+  /* T-06: phần tự viết trong trò chơi (lời nhắn hũ bình an, 3 lời biết ơn, ghi chú 4 trạm) được lưu khi có đồng ý
+   * store_narrative nhưng trước đây không qua detectPII. Trước khi lưu, soát một lượt những đoạn người dùng chưa xác nhận
+   * ở chỗ nhập (đã xác nhận thì nằm trong session.piiAcked). Nội dung check-in và nhật ký đã được soát ngay khi nhập. */
+  function pendingTextPII() {
+    if (state.mode !== 'member' || !hasConsent('store_narrative')) return [];
+    const acked = state.session.piiAcked || [];
+    const texts = gameTexts().filter(t => !acked.includes(t));
+    return texts.length ? E.detectPII(texts.join('\n')) : [];
+  }
+  const gameTexts = () => { const s = state.session; return [s.stop4p?.selfNote, ...(s.stop4p?.gratitude || []), s.relax4?.notice].filter(Boolean); };
+  function ackGameTexts() { const s = state.session; s.piiAcked = (s.piiAcked || []).concat(gameTexts()); }
+  function dropGameTexts() {
+    const s = state.session;
+    if (s.stop4p) { s.stop4p.selfNote = ''; s.stop4p.gratitude = []; }
+    if (s.relax4) s.relax4.notice = '';
+  }
+  const piiGatePanel = hits => `
+    <div class="pii-panel" role="alert">
+      <p><b>Có thể có thông tin nhận diện</b> trong phần bạn tự viết (lời nhắn, lời biết ơn, ghi chú):</p>
+      <ul>${hits.map(h => `<li><mark>${esc(h.text)}</mark> — ${esc(h.why)}</li>`).join('')}</ul>
+      <p class="fine">Bộ lọc không thể phát hiện mọi thông tin. Phần này sẽ được lưu vào hành trình của bạn.</p>
+      <div class="btn-row">
+        <button class="btn soft" data-act="piiDropSave">Bỏ phần tự viết, lưu tiếp</button>
+        <button class="btn ghost" data-act="piiSaveAnyway">Tôi đã kiểm tra, lưu tiếp</button>
+      </div>
+    </div>`;
   function startNewRound() { state.checkin = newCheckin(); state.session = newSession(); state.rec = null; state.recAttempt = 0; state.piiHits = []; }
 
   /* ================= Hành động (event delegation) ================= */
   const actions = {
-    back: () => { if (state.stack.length > 1) { try { history.back(); } catch (e) { back(); } } },
+    back: () => { if (state.stack.length > 1) { if (historyOk) history.back(); else back(); } },
     home: () => { if (state.mode) resetTo('home'); else resetTo('welcome'); },
-    startGuest: () => { state.mode = 'guest'; state.profile = null; startNewRound(); resetTo('profile', { next: 'pause5' }); },
-    endGuest: () => { state.mode = null; state.profile = null; startNewRound(); resetTo('welcome'); toast('Đã kết thúc phiên ẩn danh và xóa dữ liệu tạm.'); },
-    logout: () => { S.clearActive(); state.mode = null; state.account = null; state.memberKey = null; startNewRound(); resetTo('welcome'); toast('Đã đăng xuất.'); },
+    startGuest: () => { S.clearActive(); state.mode = 'guest'; state.profile = null; state.afterLogin = null; startNewRound(); resetTo('profile', { next: 'pause5' }); },
+    // Link "Tôi muốn tiếp tục ẩn danh" ở màn đăng nhập: đang là khách (vào từ màn Hoàn tất) thì quay lại, giữ phiên vừa làm.
+    loginAsGuest: () => { state.otp = null; if (state.mode === 'guest') { state.afterLogin = null; actions.back(); } else actions.startGuest(); },
+    endGuest: () => { state.mode = null; state.profile = null; state.afterLogin = null; startNewRound(); resetTo('welcome'); toast('Đã kết thúc phiên ẩn danh và xóa dữ liệu tạm.'); },
+    logout: () => { S.clearActive(); state.mode = null; state.account = null; state.memberKey = null; state.afterLogin = null; startNewRound(); resetTo('welcome'); toast('Đã đăng xuất.'); },
     startEx: el => {
       const id = el.dataset.id;
-      if (!EX[id]) return;
+      // N-05: khi ALLOW_DRAFT_CONTENT=false, mọi đường mở bài (trang chính, chip, nút trong cổng nín thở) cùng luật với thư viện
+      if (!EX[id] || !shownIds().includes(id)) return;
       if (!state.session.exercises.includes(id)) state.session.exercises.push(id);
       go('player', { id });
     },
     newCheckin: () => { if (state.session.saved || state.checkin.done) startNewRound(); go('pause5'); }
   };
 
+  // T-21: cú thứ hai của một lần chạm đúp rơi vào màn vừa hiện (vd. "Xong ✓" ở Check-out → trúng "Thử một bài khác"
+  // cùng vị trí ở màn Hoàn tất). Chặn ở pha capture, trước mọi listener của màn hình mới.
+  document.addEventListener('click', e => {
+    if (e.detail > 1 && performance.now() - lastRenderAt < 700) { e.preventDefault(); e.stopImmediatePropagation(); }
+  }, true);
   document.addEventListener('click', e => {
     const goEl = e.target.closest('[data-go]');
     const actEl = e.target.closest('[data-act]');
@@ -224,6 +302,10 @@
   /* ================= Các thành phần dùng chung ================= */
   const draftNote = () => C.ALLOW_DRAFT_CONTENT
     ? '<p class="draft-note">Bản thử nghiệm: nội dung bài tập chưa được hội đồng chuyên môn phê duyệt. Đây không phải công cụ chẩn đoán hay điều trị.</p>' : '';
+  // T-01: bản demo công khai (không phải localhost/file:) tắt đăng nhập, chỉ còn ẩn danh.
+  const loginOn = () => C.OTP_MODE !== 'disabled';
+  const PUBLIC_NO_LOGIN = 'Bản demo công khai chưa có đăng nhập. Bạn dùng ẩn danh nhé — không cần số điện thoại, không lưu gì trên máy. Bản chính thức sẽ đăng nhập bằng mã OTP gửi qua SMS.';
+  const noLoginNote = (cls = 'notice') => `<p class="${cls} no-login">${PUBLIC_NO_LOGIN}</p>`;
   const safetyLine = '<p class="safety-line">Bạn có thể dừng bất kỳ lúc nào; nếu chóng mặt, khó thở hoặc thấy không ổn, hãy trở lại thở tự nhiên và tìm hỗ trợ phù hợp.</p>';
 
   function exerciseCard(id, reason, primary) {
@@ -238,7 +320,7 @@
           <p class="ex-safety">⚠️ ${esc(ex.safety)}</p>
           <p class="ex-version">Nội dung ${esc(ex.version)} · ${esc(ex.reviewedBy)}</p>
         </div>
-        <button class="btn ${primary ? 'primary' : 'soft'}" data-act="startEx" data-id="${id}">Bắt đầu</button>
+        <button class="btn ${primary ? 'primary' : 'soft'}" data-act="startEx" data-id="${id}">Bắt đầu ›</button>
       </article>`;
   }
 
@@ -292,8 +374,8 @@
             <p class="fine">Phiên này không được đồng bộ hoặc lưu vào tài khoản; nội dung có thể mất khi đóng/tải lại trang.</p>
           </div>
           <div class="cta-block">
-            <button class="btn big teal" data-go="login">Đăng nhập bằng số điện thoại<small>Để lưu và xem lại hành trình</small></button>
-            <p class="fine">Dùng mã OTP. Bạn chỉ lưu khi chủ động đồng ý.</p>
+            ${loginOn() ? `<button class="btn big teal" data-go="login">Đăng nhập bằng số điện thoại<small>Để lưu và xem lại hành trình</small></button>
+            <p class="fine">Dùng mã OTP. Bạn chỉ lưu khi chủ động đồng ý.</p>` : noLoginNote()}
           </div>
         </div>
         <nav class="link-row">
@@ -311,17 +393,25 @@
     render: () => {
       const o = state.otp;
       const dev = C.OTP_MODE === 'dev-mock';
+      if (!loginOn()) {
+        return `
+          <section class="card narrow">
+            <h1>Đăng nhập chưa mở ở bản này</h1>
+            ${noLoginNote()}
+            <button class="btn primary block" data-act="loginAsGuest">Tiếp tục ẩn danh ›</button>
+          </section>`;
+      }
       if (!o || !o.sent) {
         return `
           <section class="card narrow">
             <h1>Đăng nhập bằng số điện thoại</h1>
             <p class="notice">Bạn đang chọn <b>lưu lịch sử check-in và bài tập</b>. Bạn có thể xem, xuất và xóa dữ liệu bất cứ lúc nào.</p>
             <label for="phone">Số điện thoại</label>
-            <div class="phone-row"><span class="cc">🇻🇳 +84</span><input id="phone" type="tel" inputmode="tel" autocomplete="tel-national" placeholder="09x xxx xxxx" value="${esc(o?.raw || '')}"></div>
+            <div class="phone-row"><span class="cc">🇻🇳 +84</span><input id="phone" type="tel" inputmode="tel" autocomplete="tel-national" placeholder="0912 345 678" value="${esc(o?.raw || '')}"></div>
             <p class="error" id="phone-err" role="alert">${esc(o?.error || '')}</p>
-            <button class="btn primary block" data-act="requestOtp">Gửi mã OTP</button>
+            <button class="btn primary block" data-act="requestOtp">Gửi mã ›</button>
             ${dev ? '<p class="dev-banner">Chế độ DEMO: mã OTP được giả lập và hiện trên màn hình; dữ liệu chỉ lưu trên thiết bị này. Bản chính thức cần kết nối nhà cung cấp SMS qua máy chủ.</p>' : ''}
-            <button class="link" data-act="back">Tôi muốn tiếp tục ẩn danh</button>
+            <button class="link" data-act="loginAsGuest">Tôi muốn tiếp tục ẩn danh</button>
           </section>`;
       }
       const wait = Math.max(0, Math.ceil((o.resendAt - Date.now()) / 1000));
@@ -333,15 +423,17 @@
           <label for="otp">Mã OTP</label>
           <input id="otp" class="otp-input" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="\\d{6}">
           <p class="error" id="otp-err" role="alert">${esc(o.error || '')}</p>
-          <button class="btn primary block" data-act="verifyOtp">Xác minh</button>
+          <button class="btn primary block" data-act="verifyOtp">Xác minh mã ›</button>
           <div class="row-between">
             <button class="link" data-act="resendOtp" ${wait ? 'disabled' : ''} id="resend">${wait ? `Gửi lại sau ${wait}s` : 'Gửi lại mã'}</button>
             <button class="link" data-act="changePhone">Đổi số</button>
           </div>
+          <button class="link" data-act="loginAsGuest">Tiếp tục ẩn danh</button>
         </section>`;
     },
     mount(root) {
       const o = state.otp;
+      if (!loginOn()) return;
       const input = $('#phone', root) || $('#otp', root);
       if (input) {
         input.focus();
@@ -356,16 +448,20 @@
           btn.textContent = wait ? `Gửi lại sau ${wait}s` : 'Gửi lại mã';
         }, 1000);
       }
+      // Trả về true nếu đã gửi được mã. Lỗi máy chủ (mạng hoặc HTTP ≠ 2xx) → ở lại màn số điện thoại, có đường ẩn danh (T-23).
       const sendCode = async () => {
         const o2 = state.otp;
         if (C.OTP_MODE === 'server') {
-          try { await fetch(C.OTP_ENDPOINTS.request, { method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin', body: JSON.stringify({ phone: o2.e164 }) }); }
-          catch (e) { o2.error = 'Không gửi được mã lúc này. Bạn vẫn có thể dùng ứng dụng ở chế độ ẩn danh.'; }
+          try {
+            const r = await fetch(C.OTP_ENDPOINTS.request, { method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin', body: JSON.stringify({ phone: o2.e164 }) });
+            if (!r.ok) throw new Error('http ' + r.status);
+          } catch (e) { o2.error = 'Không gửi được mã lúc này. Bạn vẫn có thể dùng ứng dụng ở chế độ ẩn danh.'; return false; }
         } else {
           const n = crypto.getRandomValues(new Uint32Array(1))[0] % 1000000;
           o2.code = String(n).padStart(6, '0');
         }
-        Object.assign(o2, { sent: true, expires: Date.now() + C.OTP_TTL_SEC * 1000, attempts: 0, resendAt: Date.now() + C.OTP_RESEND_SEC * 1000 });
+        Object.assign(o2, { sent: true, error: '', expires: Date.now() + C.OTP_TTL_SEC * 1000, attempts: 0, resendAt: Date.now() + C.OTP_RESEND_SEC * 1000 });
+        return true;
       };
       screenActions({
         requestOtp: async () => {
@@ -376,13 +472,18 @@
           await sendCode();
           rerender();
         },
-        resendOtp: async () => { if (Date.now() < state.otp.resendAt) return; await sendCode(); state.otp.error = 'Đã gửi mã mới.'; rerender(); },
+        resendOtp: async () => {
+          if (Date.now() < state.otp.resendAt) return;
+          const ok = await sendCode();
+          rerender();
+          if (ok) toast('Đã gửi mã mới.'); // thông báo thành công không nằm trong ô lỗi đỏ (T-23)
+        },
         changePhone: () => { state.otp = { raw: state.otp.raw }; rerender(); },
         verifyOtp: async () => {
           const o3 = state.otp;
           const code = $('#otp', root).value.trim();
-          if (Date.now() > o3.expires) { o3.error = 'Mã đã hết hạn. Vui lòng gửi lại mã mới.'; return rerender(); }
-          if (o3.attempts >= C.OTP_MAX_ATTEMPTS) { o3.error = 'Bạn đã nhập sai quá nhiều lần. Vui lòng gửi lại mã mới.'; return rerender(); }
+          if (Date.now() > o3.expires) { o3.error = 'Mã đã hết hạn. Bạn gửi lại mã mới nhé.'; return rerender(); }
+          if (o3.attempts >= C.OTP_MAX_ATTEMPTS) { o3.error = `Mã đã nhập sai ${C.OTP_MAX_ATTEMPTS} lần. Bạn gửi lại mã mới nhé.`; return rerender(); }
           let ok = false;
           if (C.OTP_MODE === 'server') {
             try {
@@ -392,9 +493,11 @@
           } else ok = code === o3.code;
           if (!ok) { o3.attempts++; o3.error = `Mã chưa đúng. Còn ${Math.max(0, C.OTP_MAX_ATTEMPTS - o3.attempts)} lần thử.`; return rerender(); }
           const key = await S.hashPhone(o3.e164);
-          const acc = S.load(key) || S.emptyAccount(S.maskPhone(o3.e164));
+          const acc = loadAccount(key) || S.emptyAccount(S.maskPhone(o3.e164));
           state.memberKey = key; state.account = acc; state.mode = 'member'; state.otp = null;
-          S.setActive(key); persist();
+          // T-08: KHÔNG ghi tài khoản mới xuống localStorage ở đây; chỉ ghi khi người dùng đồng ý ở màn tiếp theo
+          // (acceptConsent → persist). Đóng tab ở màn đồng ý thì không còn gì trên máy.
+          S.setActive(key);
           toast('Đăng nhập thành công.');
           if (!hasConsent('store_journal')) resetTo('consent');
           else afterMemberReady();
@@ -420,9 +523,10 @@
         <label class="check"><input type="checkbox" id="c-text" ${hasConsent('store_narrative') ? 'checked' : ''}> <span><b>Lưu cả nội dung tôi tự viết</b> (tình huống, nhật ký, lời nhắn cho mình, lời biết ơn). Mặc định tắt.</span></label>
         <label class="check"><input type="checkbox" id="c-research" ${hasConsent('research') ? 'checked' : ''}> <span><b>Đồng ý cho sử dụng số liệu tổng hợp ẩn danh phục vụ nghiên cứu.</b> Mặc định tắt, không phải điều kiện sử dụng. (Bản demo không thu thập dữ liệu nghiên cứu.)</span></label>
         <p class="error" id="consent-err" role="alert"></p>
-        <button class="btn primary block" data-act="acceptConsent">Tiếp tục</button>
+        <button class="btn primary block" data-act="acceptConsent">Tiếp tục ›</button>
         <button class="link" data-act="declineConsent">Không lưu — chuyển sang ẩn danh</button>
         <p class="fine">Không lưu: số điện thoại nguyên văn, tên, mã nhân viên. Không gửi nhật ký cho khoa/phòng hay lãnh đạo.</p>
+        <p class="fine">Lưu ý: dữ liệu nằm trên chính trình duyệt này. Trên máy dùng chung, người dùng được trình duyệt này có thể suy ra số điện thoại và đọc hành trình của bạn — trên máy chung bạn nên dùng ẩn danh.</p>
       </section>`,
     mount(root) {
       screenActions({
@@ -441,7 +545,9 @@
           S.clearActive();
           if (state.account && !state.account.checkins.length) S.remove(state.memberKey);
           state.account = null; state.memberKey = null; state.mode = 'guest';
-          resetTo(state.afterLogin === 'checkout' ? 'home' : 'profile', { next: 'pause5' });
+          const fromCheckout = state.afterLogin === 'checkout';
+          state.afterLogin = null;
+          resetTo(fromCheckout ? 'home' : 'profile', { next: 'pause5' });
         }
       });
     }
@@ -485,7 +591,7 @@
             <p class="fine">Khoa/phòng không được gửi tới AI và không dùng cho báo cáo theo khoa.</p>
           </div>
           <p class="error" id="prof-err" role="alert"></p>
-          <button class="btn primary block" data-act="saveProfile">${p.next === 'back' ? 'Lưu' : 'Lưu &amp; tiếp tục'}</button>
+          <button class="btn primary block" data-act="saveProfile">${p.next === 'back' ? 'Lưu ✓' : 'Lưu &amp; tiếp tục ›'}</button>
           ${pr.workplace_type ? '<button class="link" data-act="clearDept">Xóa thông tin khoa/phòng</button>' : ''}
           ${state.mode === 'guest' && p.next !== 'back' ? '<button class="link" data-act="skipProfile">Bỏ qua</button>' : ''}
         </section>`;
@@ -537,6 +643,8 @@
     title: 'Trang chính',
     render: () => {
       const last = state.mode === 'member' ? state.account.checkins[0] : null;
+      const shown = shownIds(), ok = id => shown.includes(id); // N-05: chỉ hiện lối mở bài đã được phép
+      const quick = ['STOP_PAUSE', 'BREATHE_46', 'GROUND_54321', 'MICRO_RECOVERY', 'SOLEUS_PUSHUP'].some(ok);
       return `
         <section class="home">
           <div class="greet">
@@ -545,20 +653,18 @@
           </div>
           <div class="tiles">
             <button class="tile main" data-act="newCheckin"><span class="t-icon">✋</span><b>Bắt đầu DỪNG 5</b><small>Check-in 1 phút · nhận tối đa 2 gợi ý</small></button>
-            <button class="tile game" data-act="startEx" data-id="STOP4P_FULL"><span class="t-icon">🗺️</span><b>Hành trình STOP-4P</b><small>9 chặng · 8–10 phút · bỏ qua chặng nào cũng được</small></button>
-            <button class="tile calm" data-act="startEx" data-id="RELAX_4STATIONS"><span class="t-icon">🧘</span><b>4 trạm – 1 phút bình an</b><small>Hơi thở · vai gáy · mặt – hàm · tâm trí · 8–10 phút</small></button>
+            ${ok('STOP4P_FULL') ? '<button class="tile game" data-act="startEx" data-id="STOP4P_FULL"><span class="t-icon">🗺️</span><b>Hành trình STOP-4P</b><small>9 chặng · 8–10 phút · bỏ qua chặng nào cũng được</small></button>' : ''}
+            ${ok('RELAX_4STATIONS') ? '<button class="tile calm" data-act="startEx" data-id="RELAX_4STATIONS"><span class="t-icon">🧘</span><b>4 trạm – 1 phút bình an</b><small>Hơi thở · vai gáy · mặt – hàm · tâm trí · 8–10 phút</small></button>' : ''}
             <button class="tile" data-go="library"><span class="t-icon">📚</span><b>Thư viện bài tập</b><small>Thở, grounding, ngủ, nghỉ ngắn…</small></button>
             ${state.mode === 'member'
               ? '<button class="tile" data-go="journey"><span class="t-icon">📈</span><b>Hành trình của tôi</b><small>Chỉ bạn xem được</small></button>'
-              : '<button class="tile" data-go="login"><span class="t-icon">💾</span><b>Muốn lưu hành trình?</b><small>Đăng nhập bằng số điện thoại</small></button>'}
+              : loginOn() ? '<button class="tile" data-go="login"><span class="t-icon">💾</span><b>Muốn lưu hành trình?</b><small>Đăng nhập bằng số điện thoại</small></button>' : ''}
           </div>
-          <div class="quick">
+          <div class="quick" ${quick ? '' : 'hidden'}>
             <p class="quick-title">Cần nhanh?</p>
             <div class="chips">
-              <button class="chip" data-act="startEx" data-id="STOP_PAUSE">✋ Dừng 5 giây</button>
-              <button class="chip" data-act="startEx" data-id="BREATHE_46">🌬️ Thở 4–6</button>
-              <button class="chip" data-act="startEx" data-id="GROUND_54321">🌿 5-4-3-2-1</button>
-              <button class="chip" data-act="startEx" data-id="MICRO_RECOVERY">☕ Nghỉ ngắn</button>
+              ${[['STOP_PAUSE', '✋ Dừng 5 giây'], ['BREATHE_46', '🌬️ Thở 4–6'], ['GROUND_54321', '🌿 5-4-3-2-1'], ['MICRO_RECOVERY', '☕ Nghỉ ngắn'], ['SOLEUS_PUSHUP', '🦵 Nâng gót khi ngồi']]
+                .filter(([id]) => ok(id)).map(([id, t]) => `<button class="chip" data-act="startEx" data-id="${id}">${t}</button>`).join('')}
             </div>
           </div>
           ${draftNote()}
@@ -579,7 +685,7 @@
     mount(root) {
       lifecycle.later(() => {
         const b = $('#pause-btn', root);
-        if (b) { b.textContent = 'Tiếp tục check-in'; b.classList.replace('soft', 'primary'); }
+        if (b) { b.textContent = 'Tiếp tục check-in ›'; b.classList.replace('soft', 'primary'); }
       }, 5000);
     }
   };
@@ -617,7 +723,8 @@
             ${chips(D.MINUTES.map(m => ({ code: String(m), label: m + ' phút' })), c.minutes ? String(c.minutes) : '', 'minutes', false)}
             <label class="check"><input type="checkbox" id="focus" ${c.focusTask ? 'checked' : ''}> <span>Tôi đang làm việc cần tập trung (chỉ hiện hướng dẫn ưu tiên an toàn)</span></label>
           </div>
-          <button class="btn primary block" data-act="submitCheckin">Xem gợi ý cho tôi</button>
+          <button class="btn primary block" id="submit-btn" data-act="submitCheckin">Xem gợi ý cho tôi</button>
+          <p class="rec-wait" id="rec-wait" role="status" aria-live="polite"></p>
           <button class="link" data-go="library">Bỏ qua, tôi tự chọn trong thư viện</button>
           <p class="fine">${state.mode === 'guest' ? 'Ẩn danh: nội dung chỉ nằm trong phiên này, không được lưu.' : hasConsent('store_narrative') ? 'Nội dung tự viết sẽ được lưu vào hành trình của bạn (bạn đã đồng ý).' : 'Chỉ lưu nhãn cảm xúc, mức khó chịu và bài tập; không lưu nội dung tự viết.'}</p>
         </section>`;
@@ -676,13 +783,21 @@
       </div>`;
   }
 
+  let recBusy = false;
   async function runRecommendation() {
+    if (recBusy) return; // bấm đúp "Xem gợi ý" không chạy hai lần
+    recBusy = true;
     const c = state.checkin;
     c.done = true;
     const main = $('#main');
     main.setAttribute('aria-busy', 'true');
-    const rec = await E.recommendWithAI({ ...c, distress: c.distress });
-    main.removeAttribute('aria-busy');
+    // T-23: chờ AI có thể tới AI_TIMEOUT_MS → nói rõ đang làm gì thay vì chỉ làm mờ màn hình
+    const btn = $('#submit-btn', main), wait = $('#rec-wait', main);
+    if (btn) { btn.disabled = true; btn.innerHTML = 'Đang tìm gợi ý…<small>vài giây thôi</small>'; }
+    if (wait) wait.textContent = 'Mình đang chọn 1–2 bài hợp với bạn…';
+    let rec;
+    try { rec = await E.recommendWithAI({ ...c, distress: c.distress }); }
+    finally { main.removeAttribute('aria-busy'); recBusy = false; }
     state.rec = rec; state.recAttempt = 0;
     if (!state.session.startedAt) state.session = newSession();
     go(rec.support_mode === 'urgent_or_uncertain' ? 'urgent' : 'result');
@@ -700,7 +815,7 @@
           <ul>
             <li>Gọi <a href="tel:115"><b>115</b></a> (cấp cứu) hoặc đến khoa Cấp cứu gần nhất.</li>
             <li>Nói ngay với một người ở gần bạn — đồng nghiệp, người phụ trách ca, người thân. Đừng ở một mình.</li>
-            ${supportChannelsList()}
+            ${supportChannelsList(true)}
           </ul>
         </div>
         <p>Trong lúc chờ, bạn có thể đặt chân chạm sàn và thở theo nhịp tự nhiên. Bài tập không thay thế cho sự giúp đỡ của con người.</p>
@@ -712,8 +827,10 @@
     }
   };
 
-  function supportChannelsList() {
-    if (!C.SUPPORT_CHANNELS.length) return '<li>Kênh hỗ trợ của cơ sở: <i>đơn vị triển khai chưa cấu hình.</i></li>';
+  // T-18: khi đơn vị chưa điền SUPPORT_CHANNELS, người dùng không thấy câu kỹ thuật. Ở màn khẩn thì bỏ hẳn dòng này
+  // (đã có 115 và "nói với người ở gần"); ở màn Hỗ trợ thì nói bằng lời thường. Hướng dẫn cấu hình nằm trong README.
+  function supportChannelsList(urgent = false) {
+    if (!C.SUPPORT_CHANNELS.length) return urgent ? '' : '<li>Cơ sở chưa công bố kênh hỗ trợ trong ứng dụng. Trong lúc chờ, bạn có thể nói với người phụ trách ca hoặc một đồng nghiệp bạn tin.</li>';
     return C.SUPPORT_CHANNELS.map(s => `<li><b>${esc(s.name)}</b>${s.detail ? ' — ' + esc(s.detail) : ''}${s.phone ? ` · <a href="tel:${esc(s.phone)}">${esc(s.phone)}</a>` : ''}</li>`).join('');
   }
 
@@ -746,8 +863,8 @@
               <button class="btn soft" data-act="applyLabels">Cập nhật gợi ý</button>
             </details>
           </div>
-          <h2 class="sec-title">Nội dung đã biên soạn</h2>
-          <div class="ex-list">${r.suggestions.map((s, i) => exerciseCard(s.exercise_id, s.reason, i === 0)).join('')}</div>
+          ${r.suggestions.length ? `<h2 class="sec-title">Nội dung đã biên soạn</h2>
+          <div class="ex-list">${r.suggestions.map((s, i) => exerciseCard(s.exercise_id, s.reason, i === 0)).join('')}</div>` : noContentCard()}
           ${r.notes.length ? `<ul class="notes">${r.notes.map(n => `<li>${esc(n)}</li>`).join('')}</ul>` : ''}
           <div class="btn-row">
             <button class="btn ghost" data-act="otherSuggestions">Không đúng với tôi — đổi gợi ý</button>
@@ -787,15 +904,27 @@
   };
 
   /* ================= Thư viện ================= */
+  // T-12: thư viện lọc cùng luật với engine.validate(): khi ALLOW_DRAFT_CONTENT=false chỉ hiện bài đã duyệt.
+  const shownIds = () => Object.keys(EX).filter(id => C.ALLOW_DRAFT_CONTENT || EX[id].status === 'approved');
+  function noContentCard() {
+    return `
+      <div class="card empty-content" role="status">
+        <p><b>Nội dung đang chờ hội đồng chuyên môn duyệt.</b> Trong lúc chờ, bạn có thể thở tự nhiên vài hơi, hoặc tìm người hỗ trợ nhé.</p>
+        <button class="btn soft" data-go="support">Tìm hỗ trợ ›</button>
+      </div>`;
+  }
   SCREENS.library = {
     title: 'Thư viện',
-    render: () => `
+    render: () => {
+      const ids = shownIds();
+      return `
       <section class="library">
         <h1>Thư viện bài tập</h1>
         <p>Chọn bất kỳ bài nào — không cần đăng nhập hay check-in.</p>
-        <div class="ex-list">${Object.keys(EX).map(id => exerciseCard(id, EX[id].goal, id === 'STOP4P_FULL')).join('')}</div>
+        ${ids.length ? `<div class="ex-list">${ids.map(id => exerciseCard(id, EX[id].goal, id === 'STOP4P_FULL')).join('')}</div>` : noContentCard()}
         ${draftNote()}
-      </section>`
+      </section>`;
+    }
   };
 
   /* ================= S07 — Trình phát ================= */
@@ -815,15 +944,15 @@
           ${safetyLine}
           ${window.STOP4P_VOICE ? window.STOP4P_VOICE.barHTML() : ''}
           <div class="player-body" id="player-body">${player.render(ex, api)}</div>
-          <div class="natural-overlay" id="natural" hidden>
+          <div class="natural-overlay" id="natural" role="dialog" aria-modal="true" aria-labelledby="natural-title" hidden>
             <div class="natural-card">
               <div class="natural-dot" aria-hidden="true"></div>
-              <h2>Trở về thở tự nhiên</h2>
+              <h2 id="natural-title" tabindex="-1">Trở về thở tự nhiên</h2>
               <p>Không cần đếm. Để hơi thở tự đi theo nhịp của nó. Nếu vẫn thấy không ổn, hãy dừng lại và tìm người hỗ trợ.</p>
               <div class="btn-row">
                 <button class="btn soft" data-act="closeNatural">Quay lại bài tập</button>
                 <button class="btn soft" data-go="support">Tìm hỗ trợ</button>
-                <button class="btn primary" data-act="finishExercise">Kết thúc bài</button>
+                <button class="btn primary" data-act="finishExercise">Kết thúc → Check-out</button>
               </div>
             </div>
           </div>
@@ -846,11 +975,20 @@
         lifecycle.onCleanup(V.watchVoices(root));
         lifecycle.onCleanup(() => { narration = null; });
       }
+      // Review lần 2 (G-06): khi lớp phủ mở, mọi thứ phía sau (header, thân bài, chân trang) là `inert` → phím Tab không ra ngoài.
+      // #header tồn tại qua các màn nên phải gỡ inert khi rời màn.
+      const setInert = on => {
+        const sec = root.querySelector('section.player');
+        [$('#header'), ...(sec ? [...sec.children].filter(el => el.id !== 'natural') : [])].forEach(el => { if (!el) return; if (on) el.setAttribute('inert', ''); else el.removeAttribute('inert'); });
+      };
+      lifecycle.onCleanup(() => setInert(false));
       screenActions({
-        natural: () => { if (local.pause) local.pause(); window.STOP4P_VOICE?.stop(); $('#natural', root).hidden = false; $('#natural h2', root).focus?.(); },
-        closeNatural: () => { $('#natural', root).hidden = true; },
+        // T-22: lớp phủ là hộp thoại thật: focus vào tiêu đề khi mở, Esc đóng, đóng xong trả focus về nút đã mở nó.
+        natural: () => { if (local.pause) local.pause(); window.STOP4P_VOICE?.stop(); $('#natural', root).hidden = false; setInert(true); $('#natural-title', root).focus({ preventScroll: true }); },
+        closeNatural: () => { setInert(false); $('#natural', root).hidden = true; $('.player-foot [data-act=natural]', root)?.focus(); },
         finishExercise: () => go('checkout')
       });
+      lifecycle.on(document, 'keydown', e => { if (e.key === 'Escape' && !$('#natural', root).hidden) currentActions.closeNatural(); });
       local.pause = player.mount($('#player-body', root), ex, api) || null;
     }
   };
@@ -868,7 +1006,8 @@
           <p class="label">Bài vừa rồi với bạn:</p>
           ${chips([{ code: 'fit', label: 'Phù hợp' }, { code: 'not_fit', label: 'Không phù hợp' }, { code: 'worse', label: 'Khó chịu hơn' }, { code: 'unsure', label: 'Chưa chắc' }], s.fit || '', 'fit', false)}
           <div id="worse-box"></div>
-          <button class="btn primary block" data-act="finishCheckout">Hoàn tất</button>
+          <div id="pii-gate"></div>
+          <button class="btn primary block" data-act="finishCheckout">Xong ✓</button>
         </section>`;
     },
     mount(root) {
@@ -889,16 +1028,23 @@
         $$('[data-chip=fit]', root).forEach(x => { const on = x.dataset.code === s.fit; x.classList.toggle('on', on); x.setAttribute('aria-pressed', on); });
         $('#worse-box', root).innerHTML = s.fit === 'worse' ? worseHTML : '';
       });
+      const complete = () => {
+        if (!touched) s.distressAfter = null;
+        if (state.checkin.distress == null) {
+          if (s.stop4p?.distress0 != null) state.checkin.distress = s.stop4p.distress0;
+          else if (s.relax4?.before != null) state.checkin.distress = s.relax4.before;
+        }
+        const saved = saveSession();
+        go('done', { saved }, { replace: true });
+      };
       screenActions({
         finishCheckout: () => {
-          if (!touched) s.distressAfter = null;
-          if (state.checkin.distress == null) {
-            if (s.stop4p?.distress0 != null) state.checkin.distress = s.stop4p.distress0;
-            else if (s.relax4?.before != null) state.checkin.distress = s.relax4.before;
-          }
-          const saved = saveSession();
-          go('done', { saved }, { replace: true });
-        }
+          const hits = s.saved ? [] : pendingTextPII();
+          if (hits.length) { $('#pii-gate', root).innerHTML = piiGatePanel(hits); $('#pii-gate', root).scrollIntoView({ block: 'center' }); return; }
+          complete();
+        },
+        piiDropSave: () => { dropGameTexts(); complete(); },
+        piiSaveAnyway: () => { ackGameTexts(); complete(); }
       });
     }
   };
@@ -918,7 +1064,7 @@
             ? (p.saved ? '<p class="ok">✓ Đã lưu vào Hành trình của tôi.</p>' : '<p class="fine">Phiên này không được lưu.</p>')
             : `<div class="guest-save">
                  <p><b>Phiên ẩn danh không được lưu.</b> Dữ liệu tạm sẽ bị xóa khi bạn kết thúc.</p>
-                 <button class="btn teal block" data-act="saveAsMember">💾 Lưu hành trình bằng số điện thoại</button>
+                 ${loginOn() ? '<button class="btn teal block" data-act="saveAsMember">💾 Lưu hành trình bằng số điện thoại</button>' : ''}
                </div>`}
           <div class="btn-row">
             ${state.rec ? '<button class="btn soft" data-act="backToResult">Thử một bài khác</button>' : ''}
@@ -952,18 +1098,26 @@
             <label class="radio"><input type="radio" name="imp" value="no" checked> Không, chỉ lưu các lần sau</label>
             <label class="radio"><input type="radio" name="imp" value="yes"> Có, lưu phiên này</label>
             <p class="fine">Các phiên ẩn danh trước đó không được ghép vào tài khoản.</p>` : '<p>Không có phiên nào để lưu.</p>'}
-          <button class="btn primary block" data-act="confirmImport">Tiếp tục</button>
+          <div id="pii-gate"></div>
+          <button class="btn primary block" data-act="confirmImport">Tiếp tục ›</button>
         </section>`;
     },
     mount(root) {
+      const finish = yes => {
+        state.afterLogin = null;
+        if (yes && saveSession()) toast('Đã lưu phiên vừa thực hiện.');
+        startNewRound();
+        resetTo('journey');
+      };
       screenActions({
         confirmImport: () => {
           const yes = ($('input[name=imp]:checked', root) || {}).value === 'yes';
-          state.afterLogin = null;
-          if (yes && saveSession()) toast('Đã lưu phiên vừa thực hiện.');
-          startNewRound();
-          resetTo('journey');
-        }
+          const hits = yes ? pendingTextPII() : [];
+          if (hits.length) { $('#pii-gate', root).innerHTML = piiGatePanel(hits); return; }
+          finish(yes);
+        },
+        piiDropSave: () => { dropGameTexts(); finish(true); },
+        piiSaveAnyway: () => { ackGameTexts(); finish(true); }
       });
     }
   };
@@ -975,18 +1129,17 @@
       if (state.mode !== 'member') return `
         <section class="card narrow"><h1>Hành trình của tôi</h1>
           <p>Chỉ dành cho người đã đăng nhập và đồng ý lưu. Chế độ ẩn danh không tạo lịch sử.</p>
-          <button class="btn primary block" data-go="login">Đăng nhập bằng số điện thoại</button></section>`;
+          ${loginOn() ? '<button class="btn primary block" data-go="login">Đăng nhập bằng số điện thoại</button>' : noLoginNote()}</section>`;
       const list = state.account.checkins;
-      const helpful = {};
-      list.forEach(r => { if (r.helpfulness === 'fit') r.exercise_ids.forEach(id => { helpful[id] = (helpful[id] || 0) + 1; }); });
-      const top = Object.entries(helpful).sort((a, b) => b[1] - a[1]).slice(0, 3);
-      const groups = {};
-      list.forEach(r => { const d = new Date(r.created_at).toLocaleDateString('vi-VN', { weekday: 'long', day: '2-digit', month: '2-digit', year: 'numeric' }); (groups[d] = groups[d] || []).push(r); });
-      return `
-        <section class="journey">
-          <h1>Hành trình của tôi</h1>
-          <p class="fine">Chỉ bạn xem được. Không dùng để đánh giá cá nhân hay khoa/phòng.</p>
-          ${list.length ? `
+      // Phần danh sách bọc try/catch: bản ghi lạ không được làm mất khối "Dữ liệu của bạn" (xuất / xóa) bên dưới.
+      let listHTML;
+      try {
+        const helpful = {};
+        list.forEach(r => { if (r.helpfulness === 'fit') r.exercise_ids.forEach(id => { if (EX[id]) helpful[id] = (helpful[id] || 0) + 1; }); });
+        const top = Object.entries(helpful).sort((a, b) => b[1] - a[1]).slice(0, 3);
+        const groups = {};
+        list.forEach(r => { const d = r.created_at ? new Date(r.created_at).toLocaleDateString('vi-VN', { weekday: 'long', day: '2-digit', month: '2-digit', year: 'numeric' }) : 'Không rõ ngày'; (groups[d] = groups[d] || []).push(r); });
+        listHTML = list.length ? `
             <div class="card">
               <h2>Mức khó chịu tự đánh giá</h2>
               ${chartSVG(list.slice(0, 14).reverse())}
@@ -995,7 +1148,15 @@
             ${top.length ? `<div class="card"><h2>Những cách bạn thấy hữu ích</h2><ul class="plain">${top.map(([id, n]) => `<li>${EX[id].icon} ${esc(EX[id].title)} <small>· ${n} lần</small></li>`).join('')}</ul></div>` : ''}
             ${Object.entries(groups).map(([day, rs]) => `
               <h2 class="day">${esc(day)}</h2>
-              ${rs.map(r => journeyItem(r)).join('')}`).join('')}` : '<div class="card"><p>Chưa có gì ở đây. Bắt đầu một lần DỪNG 5 nhé.</p><button class="btn primary" data-act="newCheckin">Bắt đầu DỪNG 5</button></div>'}
+              ${rs.map(r => journeyItem(r)).join('')}`).join('')}` : '<div class="card"><p>Chưa có gì ở đây. Bắt đầu một lần DỪNG 5 nhé.</p><button class="btn primary" data-act="newCheckin">Bắt đầu DỪNG 5 ›</button></div>';
+      } catch (e) {
+        listHTML = '<div class="card"><p>Chưa hiển thị được một phần hành trình (dữ liệu trên máy này có thể bị lỗi). Bạn vẫn xuất hoặc xóa dữ liệu ở bên dưới được.</p></div>';
+      }
+      return `
+        <section class="journey">
+          <h1>Hành trình của tôi</h1>
+          <p class="fine">Chỉ bạn xem được. Không dùng để đánh giá cá nhân hay khoa/phòng.</p>
+          ${listHTML}
           <div class="card data-tools">
             <h2>Dữ liệu của bạn</h2>
             <div class="btn-row">
@@ -1033,7 +1194,8 @@
         exportJSON: () => download('stop4p-hanh-trinh.json', JSON.stringify({ exported_at: new Date().toISOString(), profile: state.account.profile, consents: state.account.consents, checkins: state.account.checkins }, null, 2), 'application/json'),
         exportCSV: () => {
           const cols = ['created_at', 'emotions', 'distress_before', 'distress_after', 'contexts', 'exercises', 'helpfulness', 'narrative'];
-          const q = v => '"' + String(v ?? '').replace(/"/g, '""') + '"';
+          // T-11: ô bắt đầu bằng = + - @ (hoặc tab/CR) bị Excel coi là công thức → chèn dấu nháy đơn ở đầu
+          const q = v => { let t = String(v ?? ''); if (/^[=+\-@\t\r]/.test(t)) t = "'" + t; return '"' + t.replace(/"/g, '""') + '"'; };
           const rows = state.account.checkins.map(r => [r.created_at, r.emotion_codes.map(E.emotionLabel).join('; '), r.distress_before, r.distress_after,
             r.context_codes.map(E.contextLabel).join('; '), r.exercise_ids.map(id => EX[id]?.title || id).join('; '), r.helpfulness, r.narrative].map(q).join(','));
           download('stop4p-hanh-trinh.csv', '﻿' + cols.join(',') + '\n' + rows.join('\n'), 'text/csv');
@@ -1048,11 +1210,11 @@
   };
 
   function journeyItem(r) {
-    const t = new Date(r.created_at).toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit' });
+    const t = r.created_at ? new Date(r.created_at).toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit' }) : '—';
     const fitLabel = { fit: 'Phù hợp', not_fit: 'Không phù hợp', worse: 'Khó chịu hơn', unsure: 'Chưa chắc' }[r.helpfulness] || '—';
     return `
       <article class="j-item">
-        <div class="j-top"><b>${t}</b><span>${r.distress_before ?? '–'} → ${r.distress_after ?? '–'}</span></div>
+        <div class="j-top"><b>${esc(t)}</b><span>${esc(r.distress_before ?? '–')} → ${esc(r.distress_after ?? '–')}</span></div>
         ${r.emotion_codes.length ? `<p>${r.emotion_codes.map(E.emotionLabel).map(esc).join(' · ')}</p>` : ''}
         ${r.exercise_ids.length ? `<p class="fine">${r.exercise_ids.map(id => (EX[id]?.icon || '') + ' ' + esc(EX[id]?.title || id)).join(', ')} · ${fitLabel}</p>` : ''}
         ${r.narrative || r.journal ? `<details><summary>Nội dung đã viết</summary>${r.narrative ? `<p>${esc(r.narrative)}</p>` : ''}${r.journal ? `<p>${esc(Object.values(r.journal).filter(Boolean).join(' / '))}</p>` : ''}</details>` : ''}
@@ -1068,8 +1230,8 @@
     const line = key => list.map((r, i) => r[key] == null ? null : `${x(i)},${y(r[key])}`).filter(Boolean).join(' ');
     const grid = [0, 5, 10].map(v => `<line x1="${P}" x2="${W - P}" y1="${y(v)}" y2="${y(v)}" class="grid"/><text x="4" y="${y(v) + 4}" class="axis">${v}</text>`).join('');
     const dots = list.map((r, i) => `
-      ${r.distress_before != null ? `<circle cx="${x(i)}" cy="${y(r.distress_before)}" r="4" class="dot-before"><title>Trước: ${r.distress_before}</title></circle>` : ''}
-      ${r.distress_after != null ? `<circle cx="${x(i)}" cy="${y(r.distress_after)}" r="4" class="dot-after"><title>Sau: ${r.distress_after}</title></circle>` : ''}`).join('');
+      ${r.distress_before != null ? `<circle cx="${x(i)}" cy="${y(r.distress_before)}" r="4" class="dot-before"><title>Trước: ${esc(r.distress_before)}</title></circle>` : ''}
+      ${r.distress_after != null ? `<circle cx="${x(i)}" cy="${y(r.distress_after)}" r="4" class="dot-after"><title>Sau: ${esc(r.distress_after)}</title></circle>` : ''}`).join('');
     return `<svg viewBox="0 0 ${W} ${H}" class="chart" role="img" aria-label="Biểu đồ mức khó chịu tự đánh giá của ${n} lần gần nhất">
       ${grid}<polyline points="${line('distress_before')}" class="l-before"/><polyline points="${line('distress_after')}" class="l-after"/>${dots}</svg>`;
   }
@@ -1096,7 +1258,6 @@
         <div class="card">
           <h2>🏥 Kênh hỗ trợ của cơ sở</h2>
           <ul>${supportChannelsList()}</ul>
-          ${!C.SUPPORT_CHANNELS.length ? '<p class="fine">Quản trị: cập nhật SUPPORT_CHANNELS trong js/config.js sau khi đơn vị xác nhận. Không tự điền số chưa được xác nhận.</p>' : ''}
         </div>
         <div class="card">
           <h2>😴 Mệt mỏi đang ảnh hưởng đến chăm sóc người bệnh?</h2>
@@ -1117,15 +1278,25 @@
       <section class="about">
         <h1>Quyền riêng tư &amp; giới hạn</h1>
         <div class="card"><h2>Ẩn danh</h2><p>Không cần số điện thoại. Không tạo tài khoản, không lưu check-in hay nội dung bạn viết xuống thiết bị và máy chủ. Nội dung mất khi đóng hoặc tải lại trang.</p>
-          <p class="fine">Ngoại lệ duy nhất: tùy chọn giọng đọc (bật/tắt, giọng nữ hay nam, tốc độ) được nhớ trên trình duyệt này để lần sau không phải chỉnh lại. Đây là thiết lập hiển thị, không phải nội dung check-in.</p></div>
-        <div class="card"><h2>Giọng đọc</h2><p>Lời dẫn do giọng máy sẵn có của thiết bị đọc, mặc định tắt và chỉ phát khi bạn bấm bật. Ứng dụng chỉ đọc lời dẫn được soạn sẵn, không đọc nội dung bạn tự viết và không gửi gì ra ngoài.</p></div>
-        <div class="card"><h2>Đăng nhập bằng số điện thoại</h2><p>Chỉ lưu khi bạn đồng ý; tách riêng đồng ý lưu hành trình, lưu nội dung tự viết và nghiên cứu (hai mục sau mặc định tắt). Bạn có thể xem, xuất, xóa từng mục hoặc toàn bộ.</p>
-          ${C.OTP_MODE === 'dev-mock' ? '<p class="dev-banner">Bản demo: OTP giả lập, dữ liệu lưu cục bộ trên thiết bị này dưới khóa là mã băm của số điện thoại (không lưu số nguyên văn). Bản chính thức cần máy chủ, SMS OTP thật và mã hóa dữ liệu.</p>' : ''}</div>
+          ${window.STOP4P_VOICE ? '<p class="fine">Ngoại lệ duy nhất: tùy chọn giọng đọc (bật/tắt, giọng nữ hay nam, tốc độ) được nhớ trên trình duyệt này để lần sau không phải chỉnh lại. Đây là thiết lập hiển thị, không phải nội dung check-in.</p>' : ''}</div>
+        ${window.STOP4P_VOICE ? '<div class="card"><h2>Giọng đọc</h2><p>Lời dẫn do giọng máy sẵn có của thiết bị đọc, mặc định tắt và chỉ phát khi bạn bấm bật. Ứng dụng chỉ đọc lời dẫn được soạn sẵn, không đọc nội dung bạn tự viết và không gửi gì ra ngoài.</p></div>' : ''}
+        <div class="card"><h2>Đăng nhập bằng số điện thoại</h2>
+          ${loginOn() ? `<p>Chỉ lưu khi bạn đồng ý; tách riêng đồng ý lưu hành trình, lưu nội dung tự viết và nghiên cứu (hai mục sau mặc định tắt). Bạn có thể xem, xuất, xóa từng mục hoặc toàn bộ.</p>
+          ${C.OTP_MODE === 'dev-mock' ? '<p class="dev-banner">Bản demo: OTP giả lập, dữ liệu lưu cục bộ trên thiết bị này. Khóa lưu là mã băm của số điện thoại nhưng <b>không phải bảo mật</b>: trên máy dùng chung, người dùng được trình duyệt này có thể suy ra số điện thoại và đọc hành trình của bạn. Trên máy chung, bạn nên dùng ẩn danh. Bản chính thức cần máy chủ, SMS OTP thật và mã hóa dữ liệu.</p>' : ''}` : `${noLoginNote('fine')}
+          ${S.countAll() ? '<p>Máy này còn dữ liệu đăng nhập thử từ bản demo cũ. Bạn có thể xóa hết ngay tại đây.</p><button class="btn danger-soft" data-act="clearDemoData">Xóa dữ liệu demo cũ trên máy này</button>' : ''}`}</div>
         <div class="card"><h2>Gợi ý tự động</h2><p>${C.AI_RECOMMEND_ENDPOINT ? 'Có dùng AI phía máy chủ; kết quả luôn được kiểm tra lại bằng danh mục bài đã biên soạn.' : 'Hiện dùng bộ luật an toàn chạy ngay trong trình duyệt, chưa kết nối AI; nội dung bạn viết không rời khỏi thiết bị.'} Gợi ý tối đa 2 bài, bạn có thể sửa nhãn hoặc từ chối. Không chẩn đoán, không chấm điểm nguy cơ.</p></div>
         <div class="card"><h2>Người bệnh &amp; đồng nghiệp</h2><p>Đừng ghi tên, mã hồ sơ, số giường, ảnh hay chi tiết nhận diện. Ứng dụng có cảnh báo nhưng không thể phát hiện mọi thông tin.</p></div>
         <div class="card"><h2>Không dùng để quản lý nhân sự</h2><p>Không có bảng xếp hạng, không danh sách "nhân viên stress cao", không gửi nhật ký cho khoa/phòng hay lãnh đạo.</p></div>
         <div class="card"><h2>Giới hạn</h2><p>Đây không phải công cụ chẩn đoán hay điều trị và không thay thế bác sĩ/chuyên gia tâm lý. Nội dung bài tập đang ở bản thử nghiệm, chờ hội đồng chuyên môn phê duyệt.</p><p class="fine">Phiên bản ${esc(C.VERSION)}</p></div>
-      </section>`
+      </section>`,
+    mount() {
+      screenActions({
+        clearDemoData: el => {
+          if (el.dataset.armed !== '1') { el.dataset.armed = '1'; el.textContent = 'Tôi hiểu, xóa hết dữ liệu demo cũ'; return; }
+          S.removeAll(); S.clearActive(); toast('Đã xóa dữ liệu demo cũ trên máy này.'); rerender();
+        }
+      });
+    }
   };
 
   /* ================= API cho players.js ================= */
@@ -1138,6 +1309,7 @@
     cue: text => window.STOP4P_VOICE?.cue(text),
     voiceOn: () => !!window.STOP4P_VOICE?.isOn(),
     finish: () => go('checkout'),
+    canStart: id => !!EX[id] && shownIds().includes(id),
     rerender
   };
   window.STOP4P_APP = api;
@@ -1145,9 +1317,14 @@
   /* ================= Khởi động ================= */
   function boot() {
     const key = S.getActive();
-    const acc = key ? S.load(key) : null;
+    const acc = key && loginOn() ? loadAccount(key) : null; // bản công khai tắt đăng nhập thì không khôi phục phiên member
     if (acc) { state.mode = 'member'; state.memberKey = key; state.account = acc; resetTo('home'); }
-    else resetTo('welcome');
+    else {
+      // Review lần 2 (N-02): khóa phiên là mã băm SĐT (suy ngược được) → không có tài khoản đi kèm thì xóa luôn,
+      // để người dùng kế tiếp trong cùng tab không còn dấu vết số của người trước.
+      if (key) S.clearActive();
+      resetTo('welcome');
+    }
   }
   document.addEventListener('DOMContentLoaded', boot);
 })();

@@ -2,6 +2,12 @@
  * Lưu trữ.
  * - Guest: KHÔNG ghi gì xuống thiết bị hay máy chủ; mọi thứ chỉ ở bộ nhớ phiên (mất khi đóng/tải lại trang).
  * - Member (bản demo): dữ liệu lưu cục bộ trên thiết bị này, khóa theo hash số điện thoại (không lưu số nguyên văn).
+ *   LƯU Ý (T-09): salt công khai, không gian số di động nhỏ và bản ghi có số đã che (lộ đầu số + 3 số cuối) nên người có
+ *   quyền truy cập trình duyệt suy ngược được số điện thoại trong vài giây. Hash ở đây chỉ để làm khóa, KHÔNG phải bảo mật.
+ *   LƯU Ý (review lần 2, G-10): trên GitHub Pages mọi app của tài khoản ditruyenhungvuong (nhatkymebau, checkin, STOP-4P…)
+ *   chung một origin `ditruyenhungvuong.github.io` nên ĐỌC ĐƯỢC localStorage của nhau. Không sửa được ở phía app (origin do
+ *   GitHub đặt). Vì vậy bản công khai tắt đăng nhập (không ghi gì); khi bật lại member trên Pages thì dữ liệu phải nằm ở
+ *   máy chủ, không để trong localStorage — hoặc dùng tên miền riêng cho app này.
  *   Bản production cần thay bằng API /api/me/* phía server theo đặc tả mục 10.
  */
 window.STOP4P_STORE = (() => {
@@ -49,6 +55,9 @@ window.STOP4P_STORE = (() => {
   return {
     hashPhone, normalizePhone, maskPhone, load, save, emptyAccount,
     remove: key => safeDel(localStorage, PREFIX + key),
+    // Bản demo công khai tắt đăng nhập (T-01): vẫn cho người dùng xóa dữ liệu demo cũ còn sót trên máy này.
+    countAll: () => { try { return Object.keys(localStorage).filter(k => k.startsWith(PREFIX)).length; } catch (e) { return 0; } },
+    removeAll: () => { try { Object.keys(localStorage).filter(k => k.startsWith(PREFIX)).forEach(k => localStorage.removeItem(k)); } catch (e) { /* bỏ qua */ } },
     setActive: key => safeSet(sessionStorage, SESSION_KEY, key),
     getActive: () => safeGet(sessionStorage, SESSION_KEY),
     clearActive: () => safeDel(sessionStorage, SESSION_KEY)

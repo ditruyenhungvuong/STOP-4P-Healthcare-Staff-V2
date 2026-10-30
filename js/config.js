@@ -10,9 +10,18 @@ window.STOP4P_CONFIG = {
   // Không tải được ảnh → tự dùng emoji thay thế.
   ASSET_BASE: 'https://raw.githubusercontent.com/ditruyenhungvuong/nhatkymebau/main/',
 
-  // OTP: 'dev-mock' = mã giả lập hiển thị trên màn hình, dữ liệu chỉ lưu trên thiết bị này.
-  // Production PHẢI thay bằng 'server' + endpoint thật (SMS provider gọi phía server). Không dùng OTP giả khi phát hành.
-  OTP_MODE: 'dev-mock',
+  // OTP:
+  //  - 'dev-mock' = mã giả lập hiển thị trên màn hình, dữ liệu chỉ lưu trên thiết bị này. CHỈ dùng khi chạy trên máy
+  //    (localhost / 127.0.0.1 / file:) để thử. Trên máy dùng chung, ai gõ số của đồng nghiệp cũng đọc được dữ liệu của họ.
+  //  - 'disabled' = bản demo công khai (GitHub Pages): ẩn đăng nhập, chỉ còn ẩn danh (T-01, phương án a).
+  //  - 'server'   = production: SMS OTP thật gọi phía server qua OTP_ENDPOINTS. Khi có máy chủ thì thay cả biểu thức dưới bằng 'server'.
+  OTP_MODE: (() => {
+    // file: chỉ tính là "trên máy" khi KHÔNG có host. file://fileserver/... (thư mục chia sẻ của khoa, đường dẫn UNC) là máy dùng chung
+    // → tắt đăng nhập như bản công khai (review lần 2, N-04).
+    const h = location.hostname;
+    const local = (location.protocol === 'file:' && !h) || h === 'localhost' || h === '127.0.0.1' || h === '[::1]' || h === '::1' || h.endsWith('.localhost');
+    return local ? 'dev-mock' : 'disabled';
+  })(),
   OTP_ENDPOINTS: { request: '/api/auth/otp/request', verify: '/api/auth/otp/verify' },
   OTP_TTL_SEC: 300,
   OTP_MAX_ATTEMPTS: 5,
